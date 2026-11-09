@@ -45,7 +45,7 @@ class ConversationConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         root = Path(self.tmp.name)
         self.alice = Conversation("alice", "Alice", "private", root / "alice", True)
         self.group = Conversation("group", "测试群", "group", root / "group", True,
-                                  self_names=("我",), mention_mode="text", missing_sender_policy="isolated")
+                                  self_names=("我",), mention_mode="text", missing_sender_policy="shared")
         self.bob = Conversation("bob", "Bob", "private", root / "bob", True)
         self.settings = Settings(root, root / "config.yml", (self.alice, self.group, self.bob),
                                  database=root / "state.sqlite3", max_parallel_conversations=2)
@@ -105,12 +105,12 @@ class ConversationConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                          ["完成：慢任务", "完成：同窗口第二条"])
         self.assertEqual(self.agent.peaks["alice"], 1)
 
-    async def test_same_group_is_serial_across_members_and_isolated_contexts(self):
+    async def test_same_group_shares_context_and_is_serial_across_members(self):
         first = self.enqueue(self.group, "群任务一", "张三")
         second = self.enqueue(self.group, "群任务二", "李四")
         third = self.enqueue(self.group, "未识别发送人的任务")
         self.assertEqual(len({self.bridge.store.get("tasks", uid)["context"]
-                              for uid in (first, second, third)}), 3)
+                              for uid in (first, second, third)}), 1)
         self.enqueue(self.alice, "私聊")
         await self.bridge.start()
         await self.wait_started("群任务一", "私聊")

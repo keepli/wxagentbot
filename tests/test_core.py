@@ -42,8 +42,8 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNone(task_prompt(r, Message("@小明同学 任务", "Alice", "incoming")))
         self.assertEqual(task_prompt(r, Message("@小明\u2005任务", "Alice", "incoming")), "任务")
 
-    def test_unidentified_group_sender_can_use_isolated_tasks(self):
-        r = route(kind="group", self_names=("小小🤖",), mention_mode="text", missing_sender_policy="isolated")
+    def test_unidentified_group_sender_can_use_shared_context(self):
+        r = route(kind="group", self_names=("小小🤖",), mention_mode="text", missing_sender_policy="shared")
         self.assertEqual(task_prompt(r, Message("@小小🤖\u2005你好", direction="incoming")), "你好")
         for message in (Message("普通聊天", direction="incoming"),
                         Message("@小小🤖\u2005", direction="incoming"),
@@ -55,18 +55,18 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNone(task_prompt(restricted, Message("@小小🤖 你好", direction="incoming")))
         self.assertEqual(task_prompt(restricted, Message("@小小🤖 你好", "Alice", "incoming")), "你好")
 
-    def test_unidentified_sender_needs_a_unique_event_for_context(self):
-        r = route(kind="group", missing_sender_policy="isolated")
+    def test_unidentified_sender_uses_group_context_independent_of_event(self):
+        r = route(kind="group", missing_sender_policy="shared")
         m = Message("任务", direction="incoming")
-        self.assertNotEqual(context_key(r, m, event_key="g:1"), context_key(r, m, event_key="g:2"))
-        with self.assertRaises(ValueError):
-            context_key(r, m)
-        with self.assertRaises(ValueError):
-            context_key(dataclasses.replace(r, missing_sender_policy="ignore"), m, event_key="g:1")
+        self.assertEqual(context_key(r, m, event_key="g:1"), r.id)
+        self.assertEqual(context_key(r, m, event_key="g:2"), r.id)
+        self.assertEqual(context_key(r, m), r.id)
 
-    def test_context_isolated_by_group_sender(self):
+    def test_context_shared_by_group_members_but_separate_between_groups(self):
         r = route(kind="group")
-        self.assertNotEqual(context_key(r, Message("x", "A")), context_key(r, Message("x", "B")))
+        self.assertEqual(context_key(r, Message("x", "A")), context_key(r, Message("x", "B")))
+        other = dataclasses.replace(r, id="other")
+        self.assertNotEqual(context_key(r, Message("x", "A")), context_key(other, Message("x", "A")))
 
     def test_same_text_is_not_collapsed(self):
         self.assertEqual(new_tail(["A"], ["A", "A"]), [1])
@@ -118,13 +118,14 @@ class PersistenceTests(unittest.TestCase):
 
     def test_identical_unidentified_mentions_create_separate_tasks_and_deduplicate(self):
         group = dataclasses.replace(self.r, kind="group", self_names=("我",),
-                                    mention_mode="text", missing_sender_policy="isolated")
+                                    mention_mode="text", missing_sender_policy="shared")
         history = Message("历史", direction="incoming")
         mention = Message("@我 你好", direction="incoming")
         self.store.ingest(group, [history])
         self.assertEqual(self.store.ingest(group, [history, mention, mention])[0], 2)
         tasks = self.store.recent("tasks")
-        self.assertEqual(len({t["context"] for t in tasks}), 2)
+        self.assertEqual({t["context"] for t in tasks}, {group.id})
+        self.assertEqual(len({t["event_key"] for t in tasks}), 2)
         self.assertTrue(all(t["sender"] == "" and t["prompt"] == "你好" for t in tasks))
         self.store.close()
         self.store = Store(self.path)
@@ -247,9 +248,15 @@ class ConfigTests(unittest.TestCase):
                 load_settings(self.write_config(text))
 
     def test_invalid_missing_sender_policy_is_rejected(self):
-        for value in ('"shared"', '3'):
+        for value in ('"member"', '3'):
             with self.subTest(value=value), self.assertRaises(ConfigError):
                 load_settings(self.write_config('conversations:\n  - id: g\n    name: G\n    kind: group\n    missing_sender_policy: ' + value + '\n'))
+
+    def test_shared_and_legacy_missing_sender_policies_are_accepted(self):
+        for value in ('shared', 'isolated', 'ignore'):
+            with self.subTest(value=value):
+                s = load_settings(self.write_config('conversations:\n  - id: g\n    name: G\n    kind: group\n    missing_sender_policy: ' + value + '\n'))
+                self.assertEqual(s.conversations[0].missing_sender_policy, value)
 
     def test_invalid_listen_mode_is_rejected(self):
         with self.assertRaises(ConfigError):
@@ -298,6 +305,21 @@ class ConfigTests(unittest.TestCase):
                 load_settings(self.write_config('codex:\n  max_parallel_conversations: ' + value + '\n'))
         settings = load_settings(self.write_config('codex:\n  max_parallel_conversations: 2\n'))
         self.assertEqual(settings.max_parallel_conversations, 2)
+
+    def test_model_and_reasoning_effort_configuration(self):
+        settings = load_settings(self.write_config('codex:\n  model: gpt-6-luna\n  reasoning_effort: medium\n'))
+        self.assertEqual(settings.model, 'gpt-6-luna')
+        self.assertEqual(settings.reasoning_effort, 'medium')
+        self.assertIsNone(load_settings(self.write_config('codex: {}\n')).reasoning_effort)
+        for value in ('null', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'):
+            with self.subTest(value=value):
+                settings = load_settings(self.write_config('codex:\n  reasoning_effort: ' + value + '\n'))
+                self.assertEqual(settings.reasoning_effort, None if value == 'null' else value)
+
+    def test_invalid_reasoning_effort_is_rejected(self):
+        for value in ('""', '"Medium"', '"中等"', '"automatic"', 'true', '3', '[]', '{}'):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                load_settings(self.write_config('codex:\n  reasoning_effort: ' + value + '\n'))
 
     def test_scheduler_timezone_and_polling_configuration(self):
         settings = load_settings(self.write_config('scheduler:\n  timezone: UTC\n  poll_seconds: 2\n  misfire_grace_seconds: 60\n'))

@@ -14,7 +14,7 @@ from .store import Conflict, Store, destination
 from .wechat import AtspiWechat, DesktopBusy, NotSent
 from .formatting import wechat_plain_text
 from .scheduling import (ScheduleError, describe_time, next_occurrence,
-                         parse_schedule, schedule_command)
+                         parse_schedule, schedule_command, ScheduledResult)
 
 log = logging.getLogger(__name__)
 
@@ -167,15 +167,21 @@ class Bridge:
             if not route.enabled or destination(route) != task["destination"]:
                 raise ConfigError("会话配置已变更，任务未执行")
             if task["prompt"] == "/new":
-                self.store.reset(task["context"])
+                self.store.reset(route.id if route.kind == "group" else task["context"])
                 result = "已重置当前对话的任务上下文。"
             else:
                 work = task
                 if task.get("schedule_id"):
-                    work = dict(task, prompt="宿主通知：预约已到期。现在立即执行以下任务，不要等待未来时刻。\n任务内容：" + task["prompt"])
+                    timezone = self.store.get_schedule(task["schedule_id"])["timezone"]
+                    work = dict(task, prompt="宿主通知：预约已到期。现在立即执行以下任务，不要等待未来时刻。\n"
+                                + "本次执行时间：" + describe_time(self.clock(), timezone)
+                                + "\n任务内容：" + task["prompt"])
                 result = await self.agent.run(route, work)
-            reply = wechat_plain_text(result) if self.settings.reply_format == "plain" else result
-            self.store.complete_task(task, route, result, self.settings.max_reply_chars, reply=reply)
+            notify = result.notify if isinstance(result, ScheduledResult) else True
+            reply = result.message if isinstance(result, ScheduledResult) else result
+            raw = result.raw if isinstance(result, ScheduledResult) else result
+            reply = wechat_plain_text(reply) if self.settings.reply_format == "plain" else reply
+            self.store.complete_task(task, route, raw, self.settings.max_reply_chars, reply=reply, notify=notify)
         except asyncio.CancelledError:
             self.store.finish_task(task["id"], "interrupted" if self.stopping else "cancelled", "任务已停止；已发生的文件修改不会自动回滚")
             raise
@@ -264,7 +270,7 @@ class Bridge:
                 continue
             permitted = route.enabled and destination(route) == schedule["destination"]
             if route.kind == "group":
-                permitted = permitted and (bool(schedule["sender"]) or route.missing_sender_policy == "isolated")
+                permitted = permitted and (bool(schedule["sender"]) or route.missing_sender_policy in ("shared", "isolated"))
                 if route.allowed_senders:
                     permitted = permitted and schedule["sender"] in route.allowed_senders
             if not permitted:

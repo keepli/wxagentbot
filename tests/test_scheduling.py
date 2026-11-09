@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import datetime as dt
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -11,7 +12,7 @@ from zoneinfo import ZoneInfo
 from wxagentbot.config import Conversation, Settings
 from wxagentbot.demo import DemoWechat
 from wxagentbot.domain import Message
-from wxagentbot.scheduling import ScheduleError, next_occurrence, parse_schedule
+from wxagentbot.scheduling import ScheduleError, next_occurrence, parse_schedule, parse_scheduled_result
 from wxagentbot.service import Bridge
 from wxagentbot.store import Store
 
@@ -21,6 +22,27 @@ NOW = dt.datetime(2026, 11, 9, 13, 47, tzinfo=ZONE).timestamp()
 
 
 class ScheduleParsingTests(unittest.TestCase):
+    def test_create_daily_task_with_natural_language_wrapper_preserves_conditions(self):
+        action = "查询广州天河和海珠的天气，如果第二天有下雨，则发送提醒，不下雨不需要，如果第二天的温差有相差10度以上的也提醒一下"
+        for prefix in ("帮我设置个每天晚上8点执行的定时任务，", "设置一个定时任务：每天晚上8点，",
+                       "创建一个每天20:00运行的任务：", "安排一个在每天20:00执行的定时任务，",
+                       "每天20:00的定时任务，"):
+            with self.subTest(prefix=prefix):
+                plan = parse_schedule(prefix + action, now=NOW)
+                self.assertEqual(plan.prompt, action)
+                self.assertEqual(plan.recurrence, {"kind": "calendar", "hour": 20, "minute": 0, "second": 0})
+                self.assertEqual(dt.datetime.fromtimestamp(plan.due_at, ZONE).isoformat(), "2026-11-09T20:00:00+08:00")
+
+    def test_scheduled_decision_requires_boolean_and_valid_message(self):
+        for raw in ('null', '[]', '{}', '{"notify":"false","message":"","reason":""}',
+                    '{"notify":true,"message":" ","reason":""}',
+                    '{"notify":false,"message":null,"reason":""}',
+                    '{"notify":false,"message":"","reason":3}',
+                    '{"notify":false,"message":"","reason":"","other":0}',
+                    '{"notify":true,"notify":false,"message":"","reason":""}'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse_scheduled_result(raw)
+
     def test_explicit_chinese_times_dates_and_relative_delays(self):
         cases = (
             ("13点50分播报广州天气", 180, "播报广州天气"),
@@ -50,6 +72,8 @@ class ScheduleParsingTests(unittest.TestCase):
 
     def test_forecasts_log_timestamps_and_code_requests_are_immediate(self):
         for text in ("查一下广州天气", "明天广州天气怎么样", "查一下明天13:50的天气",
+                     "帮我设置Python环境", "帮我创建一个文件夹",
+                     "帮我创建一个每天20:00执行的脚本", "创建一个13点50分播报天气的程序",
                      "在广州查天气", "13:50的日志帮我分析一下", "在13:50有什么节目", "10分钟后的广州天气",
                      "帮我写一个13点50分播报天气的程序", '“13点50分播报天气”是什么意思',
                      "解释这段代码：```python\nsleep(30)\n```"):
@@ -99,9 +123,9 @@ class SchedulingPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.route = Conversation("group", "测试群", "group", root / "group", True,
-                                  self_names=("我",), mention_mode="text", missing_sender_policy="isolated")
+                                  self_names=("我",), mention_mode="text", missing_sender_policy="shared")
         self.other = Conversation("other", "其他群", "group", root / "other", True,
-                                  self_names=("我",), mention_mode="text", missing_sender_policy="isolated")
+                                  self_names=("我",), mention_mode="text", missing_sender_policy="shared")
         self.settings = Settings(root, root / "config.yml", (self.route, self.other), database=root / "db",
                                  max_parallel_conversations=1)
         self.now = NOW
@@ -148,6 +172,69 @@ class SchedulingPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call["prompt"] for call in self.agent.calls], ["1加1等于几"])
         self.assertFalse(self.bridge.active_jobs)
         self.assertEqual(self.bridge.process_schedules(), 0)
+
+    async def test_conditional_daily_task_silently_completes_then_sends_on_later_match(self):
+        _, schedule = self.register("帮我设置个每天晚上8点执行的定时任务，查询广州天河和海珠天气，有雨或温差至少10℃才提醒，否则不提醒")
+        await self.bridge.process_one_delivery()  # Registration is always acknowledged.
+        outcomes = iter((parse_scheduled_result('{"notify":false,"message":"","reason":"无雨，温差8℃"}'),
+                         parse_scheduled_result('{"notify":true,"message":"明天天河有雨，请带伞。","reason":"满足下雨条件"}')))
+
+        class ConditionalAgent:
+            async def run(self, route, task):
+                self.last_prompt = task["prompt"]
+                return next(outcomes)
+
+        self.bridge.agent = ConditionalAgent()
+        self.now = schedule["due_at"]
+        self.assertEqual(self.bridge.process_schedules(), 1)
+        first = self.bridge.store.get_schedule(schedule["id"])["last_task_id"]
+        await self.bridge.process_one_task()
+        task = self.bridge.store.get("tasks", first)
+        self.assertEqual(task["status"], "completed")
+        self.assertIsNone(task["delivery_id"])
+        self.assertFalse(json.loads(task["result"])["notify"])
+        self.assertFalse(await self.bridge.process_one_delivery())
+        self.assertEqual(len(self.ui.sent), 1)
+        self.assertIn("2026-11-09 20:00:00", self.bridge.agent.last_prompt)
+        self.assertIn("北京时间", self.bridge.agent.last_prompt)
+        upcoming = self.bridge.store.get_schedule(schedule["id"])
+        self.assertEqual(upcoming["status"], "scheduled")
+        self.now = upcoming["due_at"]
+        self.assertEqual(self.bridge.process_schedules(), 1)
+        await self.bridge.process_one_task()
+        await self.bridge.process_one_delivery()
+        self.assertEqual(self.ui.sent[-1], (self.route.id, "明天天河有雨，请带伞。"))
+        self.assertNotIn('"notify"', self.ui.sent[-1][1])
+
+    async def test_one_shot_can_complete_without_notification(self):
+        _, schedule = self.register()
+        await self.bridge.process_one_delivery()
+
+        class SilentAgent:
+            async def run(self, route, task):
+                return parse_scheduled_result('{"notify":false,"message":"","reason":"明确通知条件未满足"}')
+
+        self.bridge.agent = SilentAgent()
+        self.now = schedule["due_at"]
+        self.bridge.process_schedules()
+        await self.bridge.process_one_task()
+        self.assertEqual(self.bridge.store.get_schedule(schedule["id"])["status"], "completed")
+        self.assertFalse(await self.bridge.process_one_delivery())
+
+    async def test_failed_weather_check_is_reported_instead_of_silent(self):
+        _, schedule = self.register()
+        await self.bridge.process_one_delivery()
+
+        class FailedCheckAgent:
+            async def run(self, route, task):
+                return parse_scheduled_result('{"notify":true,"message":"天气数据查询失败，无法判断明天是否需要提醒。","reason":"缺少必要数据"}')
+
+        self.bridge.agent = FailedCheckAgent()
+        self.now = schedule["due_at"]
+        self.bridge.process_schedules()
+        await self.bridge.process_one_task()
+        await self.bridge.process_one_delivery()
+        self.assertIn("查询失败", self.ui.sent[-1][1])
 
     async def test_background_loops_run_chat_before_timer_and_trigger_automatically(self):
         self.ui.messages = self.histories

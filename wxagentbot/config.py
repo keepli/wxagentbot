@@ -66,6 +66,7 @@ class Settings:
     max_reply_chars: int = 1500
     sender_regex: str = ""
     model: str | None = None
+    reasoning_effort: str | None = None
     binary: str | None = None
     timeout_seconds: float = 600
     startup_timeout_seconds: float = 40
@@ -146,8 +147,8 @@ def load_settings(path: str | Path) -> Settings:
             raise ConfigError("需要有效会话名称和 kind=private/group")
         if c.mention_mode not in ("metadata", "text"):
             raise ConfigError("mention_mode 必须为 metadata 或 text")
-        if c.missing_sender_policy not in ("ignore", "isolated"):
-            raise ConfigError("missing_sender_policy 必须为 ignore 或 isolated")
+        if c.missing_sender_policy not in ("ignore", "shared", "isolated"):
+            raise ConfigError("missing_sender_policy 必须为 ignore 或 shared（isolated 为旧配置兼容值）")
         if c.enabled and c.kind == "group" and not c.self_names:
             raise ConfigError("启用的群聊必须填写 self_names")
         if not isinstance(c.enabled, bool) or not isinstance(c.allow_push, bool):
@@ -212,6 +213,10 @@ def load_settings(path: str | Path) -> Settings:
     for key in ("binary", "model"):
         if getattr(s, key) is not None and not isinstance(getattr(s, key), str):
             raise ConfigError(f"{key} 必须是字符串")
+    if s.reasoning_effort is not None and (
+            not isinstance(s.reasoning_effort, str)
+            or s.reasoning_effort not in ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")):
+        raise ConfigError("reasoning_effort 必须为 none/minimal/low/medium/high/xhigh/max/ultra 或 null；可用档位取决于模型")
     if not 200 <= s.max_nodes <= 30000 or not 32 <= s.max_reply_chars <= 5000:
         raise ConfigError("max_nodes 或 max_reply_chars 超出范围")
     if s.sandbox not in ("read_only", "workspace_write"):

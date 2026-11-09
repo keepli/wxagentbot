@@ -9,7 +9,8 @@ from pathlib import Path
 from .config import Conversation, Settings
 from .store import Store
 from .formatting import PLAIN_TEXT_RULES
-from .scheduling import EXECUTION_RULES
+from .scheduling import (EXECUTION_RULES, SCHEDULE_OUTPUT_SCHEMA, SCHEDULE_RESULT_RULES,
+                         ScheduledResult, parse_scheduled_result)
 
 
 class CodexAgent:
@@ -32,27 +33,23 @@ class CodexAgent:
         policy = f"{workspace}:{self.settings.sandbox}:{self.settings.model}:{instructions}"
         return context + ":" + hashlib.sha256(policy.encode()).hexdigest()[:16]
 
-    async def run(self, route: Conversation, task: dict) -> str:
+    async def run(self, route: Conversation, task: dict) -> str | ScheduledResult:
         try:
             sdk = importlib.import_module("openai_codex")
         except ImportError as e:
             raise RuntimeError("缺少官方 openai-codex SDK，请先运行 ./install.sh") from e
         route.workspace.mkdir(parents=True, exist_ok=True)
-        # Separate group senders at both the SDK context AND filesystem level.
+        # All members of a group share its context and working directory.
         cwd = route.workspace
-        unidentified = route.kind == "group" and not task["sender"]
-        if route.kind == "group":
-            if unidentified:
-                if route.missing_sender_policy != "isolated" or route.allowed_senders:
-                    raise ValueError("未识别发送人的群任务不符合当前会话策略")
-                # Use the internally generated event context as a per-task path.
-                cwd = cwd / "tasks" / hashlib.sha256(task["context"].encode()).hexdigest()[:24]
-            else:
-                cwd = cwd / hashlib.sha256(task["sender"].encode()).hexdigest()[:24]
-            cwd.mkdir(parents=True, exist_ok=True)
+        if route.kind == "group" and not task["sender"]:
+            if route.missing_sender_policy not in ("shared", "isolated") or route.allowed_senders:
+                raise ValueError("未识别发送人的群任务不符合当前会话策略")
         s = self.settings
         instructions = self.effective_instructions()
-        continuity = s.continuity and not unidentified
+        scheduled = bool(task.get("schedule_id"))
+        if scheduled:
+            instructions += "\n\n" + SCHEDULE_RESULT_RULES
+        continuity = s.continuity
         config = sdk.CodexConfig(codex_bin=s.binary, cwd=str(cwd), client_name="wxagentbot")
         client = sdk.AsyncCodex(config=config)
         turn = None
@@ -63,7 +60,13 @@ class CodexAgent:
                            developer_instructions=instructions)
             if s.model:
                 options["model"] = s.model
-            key = self.session_key(task["context"], cwd, instructions=instructions)
+            if s.reasoning_effort is not None:
+                # Override only this SDK thread, including resumed conversations.
+                options["config"] = {"model_reasoning_effort": s.reasoning_effort}
+            # Also normalize queued tasks created by older member/task routing.
+            # Scheduled occurrences retain their independent execution context.
+            context = route.id if route.kind == "group" and not task.get("schedule_id") else task["context"]
+            key = self.session_key(context, cwd, instructions=instructions)
             saved = self.store.thread_id(key) if continuity else None
             async with asyncio.timeout(s.timeout_seconds):
                 if saved:
@@ -74,12 +77,13 @@ class CodexAgent:
                     self.store.save_thread(key, thread.id)
                 # The configured conversation authorizes the task; quoted material
                 # and fetched documents retain their lower authority in Codex.
-                turn = await thread.turn(task["prompt"])
+                turn_options = {"output_schema": SCHEDULE_OUTPUT_SCHEMA} if scheduled else {}
+                turn = await thread.turn(task["prompt"], **turn_options)
                 result = await turn.run()
             final = result.final_response
             if not isinstance(final, str) or not final.strip():
                 raise RuntimeError("Codex 没有返回最终文本，请查看本地任务日志")
-            return final.strip()
+            return parse_scheduled_result(final.strip()) if scheduled else final.strip()
         except (TimeoutError, asyncio.CancelledError):
             if turn is not None:
                 with contextlib.suppress(Exception):

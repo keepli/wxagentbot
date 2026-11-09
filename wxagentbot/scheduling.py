@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import json
 import math
 import re
 from zoneinfo import ZoneInfo
@@ -18,6 +19,53 @@ class SchedulePlan:
     prompt: str
     timezone: str
     recurrence: dict | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ScheduledResult:
+    raw: str
+    notify: bool
+    message: str
+
+
+SCHEDULE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"notify": {"type": "boolean"}, "message": {"type": "string"},
+                   "reason": {"type": "string"}},
+    "required": ["notify", "message", "reason"],
+    "additionalProperties": False,
+}
+
+SCHEDULE_RESULT_RULES = (
+    "本次为宿主触发的到期任务。最终输出必须符合指定 JSON 结构，宿主只会发送 message 字段。"
+    "先执行任务、获取必要的最新数据，再严格按用户指定的与/或关系判断通知条件；条件成立时 notify=true。"
+    "仅在用户明确要求条件不满足时不通知，且已确认所有通知条件均不满足时，才设 notify=false、message为空。"
+    "reason 简要记录判断依据，供本地审计；message 使用适合微信的纯文本。"
+    "任务没有设置通知条件时正常发送结果。查询失败、数据缺失或无法确认条件时不要当作条件不满足，"
+    "应 notify=true 并在 message 中说明无法完成检查，不编造天气或结论。"
+    "任务中的“明天”“第二天”相对于宿主提供的本次执行时间解析。"
+)
+
+
+def parse_scheduled_result(raw: str) -> ScheduledResult:
+    def unique_pairs(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("预约结果包含重复字段")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(raw, object_pairs_hook=unique_pairs)
+    except (ValueError, TypeError) as e:
+        raise ValueError("预约执行结果不是有效 JSON") from e
+    if (not isinstance(value, dict) or set(value) != {"notify", "message", "reason"}
+            or not isinstance(value["notify"], bool)
+            or not isinstance(value["message"], str) or not isinstance(value["reason"], str)
+            or (value["notify"] and not value["message"].strip())):
+        raise ValueError("预约执行结果缺少有效的通知决定和消息")
+    return ScheduledResult(raw, value["notify"], value["message"])
 
 
 _NUM = r"(?:\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百]+|半)"
@@ -103,6 +151,7 @@ def _clock(text):
 
 def _action(text, *, reminder=False, clock_tail=False):
     text = text.strip(" ，,：:。")
+    text = re.sub(r"^(?:(?:执行|运行|触发)的?|的)?(?:定时任务|定时提醒|任务)(?:[，,：:\s]+|$)", "", text)
     text = re.sub(r"^(?:的时候|之后|以后|时|后)(?:[，,\s]*)", "", text)
     text = re.sub(r"^(?:再|就)(?:[，,\s]*)", "", text).strip()
     if not text or re.fullmatch(r"(?:提醒我|提醒|通知我|通知|播报|执行|帮我)", text):
@@ -158,7 +207,13 @@ def parse_schedule(text: str, *, now: float, timezone: str = "Asia/Shanghai") ->
     original = text
     while match := re.match(r"^(?:请帮我|请你帮我|请你|麻烦你|能不能|能否|帮我|请|麻烦)\s*", text):
         text = text[match.end():]
-    intro = re.match(r"^(?:设置(?:一个)?(?:定时任务|提醒)(?:在|为|[：:])?|定时(?:在)?|提醒我(?:在)?|等到|到了|到|在|于|再过|过)\s*", text)
+    first_clause = re.split(r"[，,。；;\n]", text, maxsplit=1)[0]
+    if (re.match(r"^(?:创建|生成)", text) and "定时任务" not in first_clause
+            and re.search(r"程序|脚本|代码", first_clause)):
+        return None
+    time_lead = rf"(?:每天|每日|每晚|每早|每个工作日|工作日|每周|每星期|每隔|今天|明天|后天|今晚|明晚|明早|今早|下周|下星期|{_NUM}(?:[:：点时]|秒|分钟|小时|天)|凌晨|早上|上午|中午|下午|傍晚|晚上)"
+    create = rf"(?:设置|创建|安排)(?:一个|个|一条|条)?(?:(?:定时任务|定时提醒|提醒|闹钟)(?:在|为|[：:])?|(?:在|于)?(?={time_lead}))"
+    intro = re.match(rf"^(?:{create}|定时(?:在)?|提醒我(?:在)?|等到|到了|到|在|于|再过|过)\s*", text)
     explicit = intro is not None
     reminder = bool(intro and intro[0].startswith("提醒我"))
     allow_without_after = bool(intro and intro[0].strip() in ("过", "再过"))

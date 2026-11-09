@@ -124,7 +124,8 @@ class Store:
             uid, route.id, destination(route), text, json.dumps(split_reply(text, limit), ensure_ascii=False), key, now, now))
         return self.get("deliveries", uid)
 
-    def complete_task(self, task: dict, route: Conversation, result: str, limit: int, *, reply: str | None = None):
+    def complete_task(self, task: dict, route: Conversation, result: str, limit: int, *, reply: str | None = None,
+                      notify: bool = True):
         # Persist final response and outbound message in one transaction.
         with self.db:
             if task.get("schedule_id"):
@@ -132,8 +133,10 @@ class Store:
                 if schedule["status"] in ("cancelled", "disabled"):
                     self.finish_task(task["id"], "cancelled", "预约已经取消或停用，结果未发送")
                     return
-            delivery = self._enqueue(route, result if reply is None else reply, limit, "task:" + task["id"])
-            self.db.execute("UPDATE tasks SET status='completed',result=?,delivery_id=?,updated=? WHERE id=?", (result, delivery["id"], time.time(), task["id"]))
+            if not notify and not task.get("schedule_id"):
+                raise ValueError("仅预约执行结果可以静默完成")
+            delivery = self._enqueue(route, result if reply is None else reply, limit, "task:" + task["id"]) if notify else None
+            self.db.execute("UPDATE tasks SET status='completed',result=?,delivery_id=?,updated=? WHERE id=?", (result, delivery["id"] if delivery else None, time.time(), task["id"]))
             self.db.execute("""UPDATE schedules SET status='completed',updated=?
                 WHERE id=? AND recurrence IS NULL AND status='triggered'""", (time.time(), task.get("schedule_id")))
 
@@ -164,8 +167,8 @@ class Store:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (uid, task["id"], route.id, destination(route), task["sender"],
                 plan.prompt, plan.due_at, plan.timezone,
                 json.dumps(plan.recurrence) if plan.recurrence else None, now, now))
-            label = "已安排重复任务，首次执行" if plan.recurrence else "已安排"
-            acknowledgement = (f"{label}：{describe_time(plan.due_at, plan.timezone)}。\n"
+            label = "首次执行时间" if plan.recurrence else "执行时间"
+            acknowledgement = (f"已安排定时任务。\n{label}：{describe_time(plan.due_at, plan.timezone)}。\n"
                                f"任务：{plan.prompt}\n预约编号：{uid[:8]}\n"
                                f"取消请发送：/cancel-schedule {uid[:8]}")
             self.complete_task(task, route, acknowledgement, limit)
@@ -277,8 +280,7 @@ class Store:
         if table not in ("tasks", "deliveries"):
             raise ValueError("unknown table")
         status = "running" if table == "tasks" else "sending"
-        # Each conversation has one execution lane, including groups with
-        # different senders or isolated per-message contexts. Skip its queued
+        # Each private chat or group has one execution lane. Skip its queued
         # work so a busy conversation cannot block the other conversations.
         available = """
             AND NOT EXISTS (

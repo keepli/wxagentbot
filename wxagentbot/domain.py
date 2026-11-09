@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import re
 
 from .config import Conversation
@@ -34,7 +33,7 @@ def task_prompt(route: Conversation, message: Message) -> str | None:
     if not text:
         return None
     if route.kind == "group":
-        if not message.sender and route.missing_sender_policy != "isolated":
+        if not message.sender and route.missing_sender_policy not in ("shared", "isolated"):
             return None
         if route.allowed_senders and message.sender not in route.allowed_senders:
             return None
@@ -51,15 +50,8 @@ def task_prompt(route: Conversation, message: Message) -> str | None:
 
 
 def context_key(route: Conversation, message: Message, *, event_key: str | None = None) -> str:
-    if route.kind == "private":
-        return route.id
-    if not message.sender:
-        if route.missing_sender_policy != "isolated" or not event_key:
-            raise ValueError("无法识别群发送人时，需要 isolated 策略及唯一消息事件")
-        event = hashlib.sha256(event_key.encode()).hexdigest()[:24]
-        return f"{route.id}:task:{event}"
-    sender = hashlib.sha256(message.sender.encode()).hexdigest()[:24]
-    return f"{route.id}:{sender}"
+    """Private chats and groups each have one context, independent of sender."""
+    return route.id
 
 
 def split_reply(text: str, limit: int) -> list[str]:

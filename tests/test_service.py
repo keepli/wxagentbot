@@ -237,9 +237,30 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertCountEqual(self.ui.sent, [("alice", "演示任务已完成：私聊任务"),
                                              ("group", "演示任务已完成：群任务")])
 
+    async def test_group_new_resets_shared_context_even_for_legacy_queued_task(self):
+        group = Conversation("group", "测试群", "group", self.root / "group", True,
+                             self_names=("我",), mention_mode="text", missing_sender_policy="shared")
+        self.bridge.settings = dataclasses.replace(self.settings, conversations=(self.route, group))
+        self.ui.messages[group.id] = [Message("历史", direction="incoming")]
+        await self.bridge.scan_once()
+        for context in ("group:policy", "group:old-member:policy", "alice:policy", "other-group:policy"):
+            self.bridge.store.save_thread(context, "saved-" + context)
+        self.ui.messages[group.id].append(Message("@我 /new", direction="incoming"))
+        await self.bridge.scan_once()
+        task = self.bridge.store.recent("tasks")[0]
+        # A task queued before the upgrade may still carry a member/event key.
+        with self.bridge.store.db:
+            self.bridge.store.db.execute("UPDATE tasks SET context='group:old-member' WHERE id=?", (task["id"],))
+        self.assertTrue(await self.bridge.process_one_task())
+        self.assertIsNone(self.bridge.store.thread_id("group:policy"))
+        self.assertIsNone(self.bridge.store.thread_id("group:old-member:policy"))
+        self.assertIsNotNone(self.bridge.store.thread_id("alice:policy"))
+        self.assertIsNotNone(self.bridge.store.thread_id("other-group:policy"))
+        self.assertEqual(self.bridge.store.get("tasks", task["id"])["status"], "completed")
+
     async def test_real_group_mention_without_sender_replies_while_private_still_works(self):
         group = Conversation("group", "AAA猛攻建材批发", "group", self.root / "group", True,
-                             self_names=("小小🤖",), mention_mode="text", missing_sender_policy="isolated")
+                             self_names=("小小🤖",), mention_mode="text", missing_sender_policy="shared")
         self.bridge.settings = dataclasses.replace(self.settings, conversations=(self.route, group))
         self.ui.messages["alice"] = [Message("历史", "Alice", "incoming")]
         self.ui.messages["group"] = [Message("历史", direction="incoming")]

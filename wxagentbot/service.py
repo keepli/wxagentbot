@@ -13,21 +13,29 @@ from .config import ConfigError, Settings, load_settings
 from .store import Conflict, Store, destination
 from .wechat import AtspiWechat, DesktopBusy, NotSent
 from .formatting import wechat_plain_text
+from .scheduling import (ScheduleError, describe_time, next_occurrence,
+                         parse_schedule, schedule_command)
 
 log = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass
+class _RunningTask:
+    conversation: str
+    job: asyncio.Task
+
+
 class Bridge:
-    def __init__(self, settings: Settings, *, store=None, wechat=None, agent=None):
+    def __init__(self, settings: Settings, *, store=None, wechat=None, agent=None, clock=None):
         self.settings = settings
         self.store = store if store is not None else Store(settings.database)
         self.wechat = wechat if wechat is not None else AtspiWechat(settings.wechat_options())
         self.agent = agent if agent is not None else CodexAgent(settings, self.store)
+        self.clock = clock if clock is not None else time.time
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="wechat-ui")
         self.ui_lock = asyncio.Lock()
         self.runners = []
-        self.current_job = None
-        self.current_task_id = None
+        self.active_jobs: dict[str, _RunningTask] = {}
         self.stopping = False
         self.desktop_status = "not_checked"
         self.desktop_error = None
@@ -35,6 +43,12 @@ class Bridge:
         self.scan_errors = {}
         self.windows_prepared = settings.listen_mode != "independent"
         self.window_setup_error = None
+        self.scheduler_error = None
+
+    @property
+    def current_task_id(self):
+        # Compatibility with the former single-task status field.
+        return next(iter(self.active_jobs), None)
 
     async def ui(self, method, *args):
         # A timed-out to_thread cannot be stopped safely. The driver bounds its
@@ -54,14 +68,22 @@ class Bridge:
 
     async def start(self):
         self.store.recover()
-        self.runners = [asyncio.create_task(fn(), name=name) for name, fn in (
-            ("watch", self.watch_loop), ("codex", self.task_loop), ("send", self.send_loop))]
+        self.process_schedule_requests()
+        self.process_schedules()
+        loops = [("watch", self.watch_loop), ("send", self.send_loop), ("scheduler", self.scheduler_loop)]
+        loops.extend((f"codex-{i + 1}", self.task_loop)
+                     for i in range(self.settings.max_parallel_conversations))
+        self.runners = [asyncio.create_task(fn(), name=name) for name, fn in loops]
 
     async def stop(self):
         self.stopping = True
+        jobs = [running.job for running in self.active_jobs.values()]
         for task in self.runners:
             task.cancel()
-        await asyncio.gather(*self.runners, return_exceptions=True)
+        for job in jobs:
+            if not job.cancelling():
+                job.cancel()
+        await asyncio.gather(*self.runners, *jobs, return_exceptions=True)
         await self.ui(self.wechat.close)
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.store.close()
@@ -73,6 +95,8 @@ class Bridge:
             try:
                 messages = await self.ui(self.wechat.read, route.wechat_target())
                 created, warning = self.store.ingest(route, messages)
+                if created:
+                    self.process_schedule_requests()
                 self.desktop_status, self.desktop_error = "connected", None
                 self.scan_errors.pop(route.id, None)
                 if warning:
@@ -146,7 +170,10 @@ class Bridge:
                 self.store.reset(task["context"])
                 result = "已重置当前对话的任务上下文。"
             else:
-                result = await self.agent.run(route, task)
+                work = task
+                if task.get("schedule_id"):
+                    work = dict(task, prompt="宿主通知：预约已到期。现在立即执行以下任务，不要等待未来时刻。\n任务内容：" + task["prompt"])
+                result = await self.agent.run(route, work)
             reply = wechat_plain_text(result) if self.settings.reply_format == "plain" else result
             self.store.complete_task(task, route, result, self.settings.max_reply_chars, reply=reply)
         except asyncio.CancelledError:
@@ -160,24 +187,130 @@ class Bridge:
                 self.store.enqueue(route, f"{error}。任务编号：{task['id']}。请检查本地诊断或任务记录。", self.settings.max_reply_chars, "error:" + task["id"])
 
     async def process_one_task(self):
+        if self.stopping:
+            return False
+        self.process_schedule_requests()
+        self.expire_scheduled_tasks()
+        if len(self.active_jobs) >= self.settings.max_parallel_conversations:
+            return False
         task = self.store.claim("tasks")
         if not task:
             return False
-        self.current_task_id = task["id"]
-        self.current_job = asyncio.create_task(self.execute(task))
+        uid = task["id"]
+        job = asyncio.create_task(self.execute(task), name=f"codex-task:{uid}")
+        self.active_jobs[uid] = _RunningTask(task["conversation"], job)
         try:
-            await self.current_job
+            await job
         except asyncio.CancelledError:
-            if self.stopping:
+            # A job can be cancelled before execute() even starts. Release its
+            # persisted running state as well as the in-memory execution slot.
+            if self.store.get("tasks", uid)["status"] == "running":
+                self.store.finish_task(uid, "interrupted" if self.stopping else "cancelled",
+                                       "任务已停止；已发生的文件修改不会自动回滚")
+            if self.stopping or asyncio.current_task().cancelling():
                 raise
         finally:
-            self.current_job = self.current_task_id = None
+            self.active_jobs.pop(uid, None)
         return True
 
     async def task_loop(self):
         while True:
             if not await self.process_one_task():
                 await asyncio.sleep(0.3)
+
+    def process_schedule_requests(self, *, now=None):
+        now = self.clock() if now is None else now
+        for task in self.store.pending_intake():
+            try:
+                route = self.settings.resolve(task["conversation"])
+            except ConfigError:
+                self.store.intake_checked(task["id"])
+                continue
+            if not route.enabled or destination(route) != task["destination"]:
+                self.store.intake_checked(task["id"])
+                continue
+            try:
+                command = schedule_command(task["prompt"])
+                if command:
+                    action, uid = command
+                    if action == "cancel":
+                        schedule = self.cancel_schedule(uid, route.id)
+                        result = f"已取消预约 {schedule['id'][:8]}。"
+                    else:
+                        schedules = self.store.list_schedules(route.id, active_only=True)
+                        lines = [f"{s['id'][:8]}：{describe_time(s['due_at'], s['timezone'])}，{s['prompt'][:100]}"
+                                 for s in schedules[:20]]
+                        result = "本会话的预约：\n" + "\n".join(lines) if lines else "本会话没有等待执行的预约。"
+                    self.store.complete_task(task, route, result, self.settings.max_reply_chars)
+                    continue
+                plan = parse_schedule(task["prompt"], now=now, timezone=self.settings.schedule_timezone)
+                if plan is not None:
+                    self.store.register_schedule(task, route, plan, self.settings.max_reply_chars)
+                else:
+                    self.store.intake_checked(task["id"])
+            except (ScheduleError, Conflict, KeyError) as e:
+                result = "本会话没有找到这个预约，请发送 /schedules 查看编号。" if isinstance(e, KeyError) else str(e)
+                self.store.complete_task(task, route, result, self.settings.max_reply_chars)
+
+    def process_schedules(self, *, now=None):
+        now = self.clock() if now is None else now
+        self.expire_scheduled_tasks(now=now)
+        dispatched = 0
+        for schedule in self.store.due_schedules(now):
+            try:
+                route = self.settings.resolve(schedule["conversation"])
+            except ConfigError:
+                self.store.skip_schedule(schedule, None, now, None, disabled=True)
+                continue
+            permitted = route.enabled and destination(route) == schedule["destination"]
+            if route.kind == "group":
+                permitted = permitted and (bool(schedule["sender"]) or route.missing_sender_policy == "isolated")
+                if route.allowed_senders:
+                    permitted = permitted and schedule["sender"] in route.allowed_senders
+            if not permitted:
+                self.store.skip_schedule(schedule, None, now, None, disabled=True)
+                continue
+            try:
+                recurrence = json.loads(schedule["recurrence"]) if schedule["recurrence"] else None
+                next_due = next_occurrence(recurrence, now, schedule["timezone"], previous=schedule["due_at"])
+            except (ScheduleError, ValueError, KeyError, TypeError):
+                self.store.skip_schedule(schedule, None, now, None, disabled=True)
+                continue
+            if now - schedule["due_at"] > self.settings.schedule_grace_seconds:
+                self.store.skip_schedule(schedule, route, now, next_due, limit=self.settings.max_reply_chars)
+            elif self.store.dispatch_schedule(schedule, route, now, next_due):
+                dispatched += 1
+        return dispatched
+
+    def expire_scheduled_tasks(self, *, now=None):
+        now = self.clock() if now is None else now
+        for task in self.store.stale_scheduled_tasks(now, self.settings.schedule_grace_seconds):
+            try:
+                route = self.settings.resolve(task["conversation"])
+                if not route.enabled or destination(route) != task["destination"]:
+                    route = None
+            except ConfigError:
+                route = None
+            self.store.expire_scheduled_task(task, route, self.settings.max_reply_chars)
+
+    async def scheduler_loop(self):
+        while True:
+            try:
+                self.process_schedule_requests()
+                self.process_schedules()
+                self.scheduler_error = None
+            except Exception as e:
+                self.scheduler_error = f"定时调度失败（{type(e).__name__}）"
+                log.warning("scheduler failed: %s", type(e).__name__)
+            await asyncio.sleep(self.settings.schedule_poll_seconds)
+
+    def cancel_schedule(self, uid, conversation=None):
+        schedule = self.store.cancel_schedule(uid, conversation)
+        for task_id, running in list(self.active_jobs.items()):
+            task = self.store.get("tasks", task_id)
+            if task.get("schedule_id") == schedule["id"] and not running.job.done():
+                running.job.cancel()
+        return schedule
 
     async def process_one_delivery(self):
         delivery = self.store.claim("deliveries")
@@ -215,7 +348,7 @@ class Bridge:
             raise ConfigError("消息最多 16000 字，会话名称最多 200 字")
         if key is not None and (not isinstance(key, str) or not 1 <= len(key) <= 128):
             raise ConfigError("Idempotency-Key 长度必须在 1..128")
-        if key and key.startswith(("task:", "error:")):
+        if key and key.startswith(("task:", "error:", "schedule:")):
             raise ConfigError("Idempotency-Key 使用了保留前缀")
         route = self.settings.resolve(conversation)
         if not route.allow_push:
@@ -226,8 +359,9 @@ class Bridge:
         task = self.store.get("tasks", uid)
         if not task:
             raise KeyError(uid)
-        if uid == self.current_task_id and self.current_job:
-            self.current_job.cancel()
+        running = self.active_jobs.get(uid)
+        if task["status"] == "running" and running is not None and not running.job.done():
+            running.job.cancel()
         elif task["status"] == "queued":
             self.store.finish_task(uid, "cancelled", "任务已取消")
         else:
@@ -240,7 +374,7 @@ class Bridge:
         after.pop("conversations")
         if before != after:
             raise ConfigError("运行中只支持重载 conversations，其他设置请重启服务")
-        if self.current_task_id:
+        if self.active_jobs:
             raise Conflict("当前有任务执行中，请完成或取消后重载")
         old_routes = {c.id: c for c in self.settings.conversations}
         # Do not permit queued work to move into a new workspace or recipient.
@@ -265,6 +399,10 @@ class Bridge:
     def status(self):
         return {"desktop": self.desktop_status, "desktop_error": self.desktop_error,
                 "active_task": self.current_task_id, "queues": self.store.counts(),
+                "active_tasks": [{"id": uid, "conversation": running.conversation}
+                                 for uid, running in self.active_jobs.items()],
+                "max_parallel_conversations": self.settings.max_parallel_conversations,
+                "schedules": self.store.schedule_counts(), "scheduler_error": self.scheduler_error,
                 "watching": [c.id for c in self.settings.conversations if c.enabled],
                 "scan_warnings": self.scan_warnings,
                 "scan_errors": self.scan_errors, "listen_mode": self.settings.listen_mode,

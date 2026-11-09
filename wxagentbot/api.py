@@ -104,6 +104,25 @@ def create_app(settings, *, bridge=None):
     async def tasks():
         return service.store.recent("tasks")
 
+    @app.get("/v1/schedules", dependencies=auth)
+    async def schedules():
+        return service.store.list_schedules()
+
+    @app.get("/v1/schedules/{uid}", dependencies=auth)
+    async def schedule(uid: str):
+        try:
+            return service.store.get_schedule(uid)
+        except KeyError as e:
+            raise HTTPException(404, "预约不存在") from e
+
+    @app.post("/v1/schedules/{uid}/cancel", dependencies=auth)
+    async def cancel_schedule(uid: str):
+        try:
+            row = service.cancel_schedule(uid)
+        except KeyError as e:
+            raise HTTPException(404, "预约不存在") from e
+        return {"id": row["id"], "status": row["status"]}
+
     @app.get("/v1/tasks/{uid}", dependencies=auth)
     async def task(uid: str):
         row = service.store.get("tasks", uid)

@@ -4,6 +4,7 @@ import dataclasses
 import re
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -68,12 +69,16 @@ class Settings:
     binary: str | None = None
     timeout_seconds: float = 600
     startup_timeout_seconds: float = 40
+    max_parallel_conversations: int = 3
     sandbox: str = "workspace_write"
     approval_mode: str = "deny_all"
     continuity: bool = True
     instructions: str = "请完成任务，用简洁中文回复最终结果。"
     instructions_file: Path | None = None
     reply_format: str = "plain"
+    schedule_timezone: str = "Asia/Shanghai"
+    schedule_poll_seconds: float = 1
+    schedule_grace_seconds: float = 300
 
     def wechat_options(self) -> WechatOptions:
         return WechatOptions(app_name=self.app_name, listen_mode=self.listen_mode,
@@ -110,7 +115,7 @@ def load_settings(path: str | Path) -> Settings:
         doc = {}
     if not isinstance(doc, dict):
         raise ConfigError("YAML 配置顶层必须是映射")
-    if set(doc) - {"server", "wechat", "codex", "storage", "conversations"}:
+    if set(doc) - {"server", "wechat", "codex", "storage", "scheduler", "conversations"}:
         raise ConfigError("存在未知的配置节")
     if not isinstance(doc.get("conversations", []), list):
         raise ConfigError("conversations 必须是 YAML 列表")
@@ -165,6 +170,16 @@ def load_settings(path: str | Path) -> Settings:
         if overlap:
             raise ConfigError("配置项出现在多个节中")
         kwargs.update(doc.get(section, {}))
+    scheduler = doc.get("scheduler", {})
+    scheduler_fields = {"timezone": "schedule_timezone", "poll_seconds": "schedule_poll_seconds",
+                        "misfire_grace_seconds": "schedule_grace_seconds"}
+    if not isinstance(scheduler, dict) or set(scheduler) - scheduler_fields.keys():
+        raise ConfigError("scheduler 只接受 timezone、poll_seconds、misfire_grace_seconds")
+    for key, value in scheduler.items():
+        field = scheduler_fields[key]
+        if field in kwargs:
+            raise ConfigError("定时配置项出现在多个节中")
+        kwargs[field] = value
     kwargs["token_file"] = absolute(kwargs.get("token_file", ".secrets/api-token"))
     kwargs["database"] = absolute(kwargs.get("database", "data/bridge.sqlite3"))
     if kwargs.get("instructions_file") is not None:
@@ -176,7 +191,8 @@ def load_settings(path: str | Path) -> Settings:
     s = _construct(Settings, kwargs, root=root, path=path, conversations=tuple(routes))
     if not isinstance(s.port, int) or isinstance(s.port, bool) or not 1 <= s.port <= 65535:
         raise ConfigError("port 必须在 1..65535")
-    for key in ("poll_seconds", "rescan_seconds", "operation_timeout_seconds", "timeout_seconds", "startup_timeout_seconds"):
+    for key in ("poll_seconds", "rescan_seconds", "operation_timeout_seconds", "timeout_seconds", "startup_timeout_seconds",
+                "schedule_poll_seconds", "schedule_grace_seconds"):
         value = getattr(s, key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.1 <= value <= 86400:
             raise ConfigError(f"{key} 必须在 0.1..86400 秒")
@@ -186,7 +202,11 @@ def load_settings(path: str | Path) -> Settings:
     for key in ("max_nodes", "max_reply_chars"):
         if not isinstance(getattr(s, key), int) or isinstance(getattr(s, key), bool):
             raise ConfigError(f"{key} 必须是整数")
-    for key in ("host", "app_name", "sender_regex", "sandbox", "approval_mode", "instructions"):
+    if (isinstance(s.max_parallel_conversations, bool)
+            or not isinstance(s.max_parallel_conversations, int)
+            or not 1 <= s.max_parallel_conversations <= 16):
+        raise ConfigError("max_parallel_conversations 必须是 1..16 的整数")
+    for key in ("host", "app_name", "sender_regex", "sandbox", "approval_mode", "instructions", "schedule_timezone"):
         if not isinstance(getattr(s, key), str):
             raise ConfigError(f"{key} 必须是字符串")
     for key in ("binary", "model"):
@@ -202,6 +222,10 @@ def load_settings(path: str | Path) -> Settings:
         raise ConfigError("approval_mode 只支持 deny_all/auto_review")
     if s.reply_format not in ("plain", "raw"):
         raise ConfigError("reply_format 必须为 plain 或 raw")
+    try:
+        ZoneInfo(s.schedule_timezone)
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        raise ConfigError("scheduler.timezone 必须是有效时区，例如 Asia/Shanghai") from e
     if s.sender_regex:
         p = re.compile(s.sender_regex)
         if not {"sender", "text"} <= p.groupindex.keys():

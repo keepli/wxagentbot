@@ -291,3 +291,21 @@ class ConfigTests(unittest.TestCase):
         path = self.write_config('server:\n  port: 9000\n')
         renamed = path.rename(path.with_suffix('.yaml'))
         self.assertEqual(load_settings(renamed).port, 9000)
+
+    def test_parallel_conversation_limit_requires_bounded_integer(self):
+        for value in ('0', '17', 'true', '1.5', '"3"'):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                load_settings(self.write_config('codex:\n  max_parallel_conversations: ' + value + '\n'))
+        settings = load_settings(self.write_config('codex:\n  max_parallel_conversations: 2\n'))
+        self.assertEqual(settings.max_parallel_conversations, 2)
+
+    def test_scheduler_timezone_and_polling_configuration(self):
+        settings = load_settings(self.write_config('scheduler:\n  timezone: UTC\n  poll_seconds: 2\n  misfire_grace_seconds: 60\n'))
+        self.assertEqual(settings.schedule_timezone, 'UTC')
+        self.assertEqual(settings.schedule_poll_seconds, 2)
+        self.assertEqual(settings.schedule_grace_seconds, 60)
+        for text in ('scheduler:\n  timezone: Not/A_Timezone\n', 'scheduler:\n  timezone: 3\n',
+                     'scheduler:\n  poll_seconds: 0\n', 'scheduler:\n  misfire_grace_seconds: "300"\n',
+                     'scheduler:\n  unknown: true\n', 'scheduler: []\n'):
+            with self.subTest(text=text), self.assertRaises(ConfigError):
+                load_settings(self.write_config(text))

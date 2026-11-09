@@ -9,6 +9,7 @@ from unittest.mock import patch
 from wxagentbot.codex_agent import CodexAgent
 from wxagentbot.config import Conversation, Settings
 from wxagentbot.store import Store
+from wxagentbot.scheduling import EXECUTION_RULES
 
 
 class OfficialSdkContractTests(unittest.IsolatedAsyncioTestCase):
@@ -142,4 +143,79 @@ class OfficialSdkContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_raw_reply_mode_does_not_add_plain_text_rules(self):
         self.agent.settings = dataclasses.replace(self.settings, reply_format="raw")
-        self.assertEqual(self.agent.effective_instructions(), self.settings.instructions)
+        self.assertEqual(self.agent.effective_instructions(), self.settings.instructions + "\n\n" + EXECUTION_RULES)
+
+    async def parallel_failure(self, failure):
+        started = {name: asyncio.Event() for name in ("first", "other")}
+        release = {name: asyncio.Event() for name in started}
+        interrupted, closed, clients = [], [], []
+
+        class Turn:
+            def __init__(self, prompt):
+                self.prompt = prompt
+
+            async def run(self):
+                started[self.prompt].set()
+                await release[self.prompt].wait()
+                if self.prompt == "first" and failure == "timeout":
+                    raise TimeoutError
+                return types.SimpleNamespace(final_response=self.prompt + " final")
+
+            async def interrupt(self):
+                interrupted.append(self.prompt)
+
+        class Thread:
+            def __init__(self, uid):
+                self.id = uid
+
+            async def turn(self, prompt):
+                return Turn(prompt)
+
+        class Client:
+            def __init__(self, config):
+                self.uid = "client-" + str(len(clients))
+                clients.append(self)
+
+            async def __aenter__(self):
+                return self
+
+            async def thread_start(self, **kwargs):
+                return Thread(self.uid)
+
+            async def close(self):
+                closed.append(self.uid)
+
+        sdk = types.SimpleNamespace(
+            AsyncCodex=Client, CodexConfig=lambda **kw: kw,
+            Sandbox=types.SimpleNamespace(workspace_write="workspace_write"),
+            ApprovalMode=types.SimpleNamespace(deny_all="deny_all"))
+        other_route = dataclasses.replace(self.route, id="b", workspace=Path(self.tmp.name) / "other")
+        with patch.dict("sys.modules", {"openai_codex": sdk}):
+            first = asyncio.create_task(self.agent.run(self.route, {"context": "a", "sender": "Alice", "prompt": "first"}))
+            other = asyncio.create_task(self.agent.run(other_route, {"context": "b", "sender": "Bob", "prompt": "other"}))
+            try:
+                await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started.values())), 2)
+                if failure == "cancel":
+                    first.cancel()
+                else:
+                    release["first"].set()
+                with self.assertRaises(asyncio.CancelledError if failure == "cancel" else TimeoutError):
+                    await first
+                self.assertEqual(interrupted, ["first"])
+                self.assertFalse(other.done())
+                self.assertEqual(len(clients), 2)
+                self.assertEqual(closed, [clients[0].uid])
+                release["other"].set()
+                self.assertEqual(await other, "other final")
+                self.assertCountEqual(closed, [client.uid for client in clients])
+            finally:
+                for job in (first, other):
+                    if not job.done():
+                        job.cancel()
+                await asyncio.gather(first, other, return_exceptions=True)
+
+    async def test_parallel_cancellation_interrupts_only_its_own_sdk_turn(self):
+        await self.parallel_failure("cancel")
+
+    async def test_parallel_timeout_interrupts_only_its_own_sdk_turn(self):
+        await self.parallel_failure("timeout")

@@ -10,9 +10,10 @@
 | `wechat_types.py` | 通用桌面参数、会话标识和消息类型，不含模型、任务或数据库配置 |
 | `window.py`、`capture.py` | 按进程与标题定位窗口、后台读取窗口像素 |
 | `domain.py` | 私聊/群 @ 触发规则、业务上下文、快照增量对比 |
-| `store.py`、`service.py` | 任务与发送队列、数据库、重启恢复、串行调度桌面操作 |
+| `store.py`、`service.py` | 任务与发送队列、数据库、重启恢复、会话间并发与桌面串行调度 |
 | `codex_agent.py` | 官方 Codex SDK 调用、提示词与会话续接 |
 | `formatting.py` | AI 回复的微信纯文本展示；底层发送保持原文 |
+| `scheduling.py` | 定时语句识别、时区转换和下一次时间计算，不操作微信或启动模型 |
 
 公开入口是 `WechatClient`（`AtspiWechat` 的别名）、`WechatOptions`、`ChatTarget` 和 `Message`。业务侧的 `Settings`、`Conversation` 通过转换方法生成通用参数；适配器不会反过来读取业务配置。
 

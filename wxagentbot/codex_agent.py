@@ -9,6 +9,7 @@ from pathlib import Path
 from .config import Conversation, Settings
 from .store import Store
 from .formatting import PLAIN_TEXT_RULES
+from .scheduling import EXECUTION_RULES
 
 
 class CodexAgent:
@@ -16,7 +17,6 @@ class CodexAgent:
 
     def __init__(self, settings: Settings, store: Store):
         self.settings, self.store = settings, store
-        self.active = None
 
     def effective_instructions(self) -> str:
         parts = [self.settings.instructions]
@@ -24,6 +24,7 @@ class CodexAgent:
             parts.append(self.settings.instructions_file.read_text(encoding="utf-8"))
         if self.settings.reply_format == "plain":
             parts.append(PLAIN_TEXT_RULES)
+        parts.append(EXECUTION_RULES)
         return "\n\n".join(p.strip() for p in parts if p.strip())
 
     def session_key(self, context: str, workspace: Path, *, instructions=None) -> str:
@@ -54,6 +55,7 @@ class CodexAgent:
         continuity = s.continuity and not unidentified
         config = sdk.CodexConfig(codex_bin=s.binary, cwd=str(cwd), client_name="wxagentbot")
         client = sdk.AsyncCodex(config=config)
+        turn = None
         try:
             await asyncio.wait_for(client.__aenter__(), s.startup_timeout_seconds)
             options = dict(cwd=str(cwd), sandbox=getattr(sdk.Sandbox, s.sandbox),
@@ -73,18 +75,16 @@ class CodexAgent:
                 # The configured conversation authorizes the task; quoted material
                 # and fetched documents retain their lower authority in Codex.
                 turn = await thread.turn(task["prompt"])
-                self.active = turn
                 result = await turn.run()
             final = result.final_response
             if not isinstance(final, str) or not final.strip():
                 raise RuntimeError("Codex 没有返回最终文本，请查看本地任务日志")
             return final.strip()
         except (TimeoutError, asyncio.CancelledError):
-            if self.active:
+            if turn is not None:
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(self.active.interrupt(), 5)
+                    await asyncio.wait_for(turn.interrupt(), 5)
             raise
         finally:
-            self.active = None
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(client.close(), 5)

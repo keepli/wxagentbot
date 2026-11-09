@@ -1,0 +1,15 @@
+[Unit]
+Description=wxagentbot (user graphical session)
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Desktop/wxagentbot
+Environment=DISPLAY=:1
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart=%h/Desktop/wxagentbot/run.sh serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

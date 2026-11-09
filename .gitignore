@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.secrets/
+data/
+logs/
+workspaces/
+config.yml
+config.yaml
+*.local.yml
+*.local.yaml
+.pytest_cache/

@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from wxagentbot.wechat_types import ChatTarget, WechatOptions
-from wxagentbot.wechat import AtspiWechat, DesktopUnavailable, NotSent, SendUncertain, human_controls_desktop
+from wxagentbot.wechat import AtspiWechat, AppLookupError, DesktopUnavailable, NotSent, SendUncertain, human_controls_desktop
 
 
 class Node:
@@ -31,6 +31,94 @@ class Node:
     def get_text(self, start, end): return self.text[start:end]
     def get_editable_text_iface(self): return self
     def set_text_contents(self, text): self.text = text; return True
+
+
+class ApplicationLookupTests(unittest.TestCase):
+    class Application(Node):
+        def __init__(self, pid=42, name="wechat", defunct=False, children=None):
+            super().__init__(name, "application", children=children if children is not None else [Node("微信", "frame")])
+            self.pid, self.defunct, self.refreshes = pid, defunct, 0
+
+        def clear_cache_single(self): self.refreshes += 1
+        def clear_cache(self): self.refreshes += 1
+        def get_process_id(self): return self.pid
+        def get_state_set(self): return types.SimpleNamespace(contains=lambda state: self.defunct)
+
+    def driver(self, *apps):
+        desktop = Node(children=list(apps))
+        desktop.clear_cache_single = lambda: None
+        driver = AtspiWechat(WechatOptions())
+        driver.deadline = float("inf")
+        driver.Atspi = types.SimpleNamespace(get_desktop=lambda n: desktop,
+                                            StateType=types.SimpleNamespace(DEFUNCT="defunct"))
+        driver._foreground = driver._click = driver._human_control = lambda *args: self.fail("lookup must stay read-only")
+        return driver, desktop
+
+    def test_refreshes_registry_and_names_before_matching(self):
+        app = self.Application(name="old-name")
+        driver, desktop = self.driver()
+        desktop.clear_cache_single = lambda: setattr(desktop, "children", [app])
+        app.clear_cache_single = lambda: setattr(app, "name", " WeChat ")
+        self.assertIs(driver._app(), app)
+        self.assertEqual(driver.app_diagnostics["selected_pid"], 42)
+
+    def test_ignores_defunct_unreadable_and_windowless_entries(self):
+        dead = self.Application(pid=10, defunct=True)
+        unreadable = self.Application(pid=11)
+        def failed(): raise RuntimeError("disconnected")
+        unreadable.get_state_set = failed
+        empty = self.Application(pid=12, children=[])
+        valid = self.Application(pid=13)
+        driver, _ = self.driver(dead, unreadable, empty, valid)
+        self.assertIs(driver._app(), valid)
+        report = driver.app_diagnostics
+        self.assertEqual(report["matching_entries"], 4)
+        self.assertEqual(report["candidate_pids"], [13])
+        self.assertEqual([a["state"] for a in report["applications"]],
+                         ["defunct", "unavailable", "no_windows", "available"])
+
+    def test_duplicate_process_prefers_root_with_main_window(self):
+        proxy = self.Application(children=[Node("夜伴", "frame")])
+        root = self.Application(children=[Node("微信", "frame"), Node("夜伴", "frame")])
+        driver, _ = self.driver(proxy, root)
+        self.assertIs(driver._app(), root)
+        self.assertEqual(driver.app_diagnostics["candidate_pids"], [42])
+
+    def test_multiple_real_clients_are_rejected_without_guessing(self):
+        driver, _ = self.driver(self.Application(pid=42), self.Application(pid=43))
+        with self.assertRaisesRegex(AppLookupError, "多个可用微信进程"):
+            driver._app()
+        self.assertEqual(driver.app_diagnostics["candidate_pids"], [42, 43])
+        self.assertIsNone(driver.app_diagnostics["selected_pid"])
+
+    def test_missing_app_reports_actual_names_and_can_recover_next_scan(self):
+        driver, desktop = self.driver(self.Application(name="Thunar"))
+        with self.assertRaisesRegex(AppLookupError, "同名条目=0.*Thunar"):
+            driver._app()
+        self.assertNotIn("请先登录", driver.app_diagnostics["error"])
+        desktop.children = [self.Application()]
+        driver._app()
+        self.assertNotIn("error", driver.app_diagnostics)
+
+    def test_unknown_process_id_is_not_used_as_a_unique_identity(self):
+        for pid in (0, -1, 2 ** 32 - 1):
+            with self.subTest(pid=pid):
+                driver, _ = self.driver(self.Application(pid=pid))
+                with self.assertRaisesRegex(AppLookupError, "同名条目=1.*可用进程=0"):
+                    driver._app()
+
+    def test_minimized_app_does_not_need_showing_state_for_lookup(self):
+        app = self.Application()
+        driver, _ = self.driver(app)
+        driver._showing = lambda n: False
+        self.assertIs(driver._app(), app)
+
+    def test_broken_registry_is_a_discovery_error(self):
+        driver, desktop = self.driver()
+        def failed(): raise RuntimeError("registry disconnected")
+        desktop.get_child_count = failed
+        with self.assertRaisesRegex(AppLookupError, "无法读取桌面 AT-SPI 应用列表"):
+            driver._app()
 
 
 class NativeAdapterTests(unittest.TestCase):
@@ -140,6 +228,25 @@ class NativeAdapterTests(unittest.TestCase):
             self.driver.prepare_windows([self.route])
             self.driver.prepare_windows([self.route])
         self.assertEqual(len(calls), 1)
+
+    def test_disconnection_after_window_input_is_not_a_retryable_preflight_error(self):
+        frame, li, app = self.silent_tree()
+        app.children.remove(frame)
+        row = Node("夜伴\n最新消息", "list item")
+        calls, lookups = [], []
+        def lookup():
+            lookups.append(True)
+            if len(lookups) == 3:
+                raise AppLookupError("AT-SPI 临时不可用")
+            return app
+        self.driver._app = lookup
+        self.driver._select_main = lambda route: ([row], li)
+        self.driver._human_control = lambda: None
+        self.driver._click = lambda node, **kw: calls.append(node)
+        with patch("wxagentbot.wechat.time.sleep"), self.assertRaises(DesktopUnavailable) as error:
+            self.driver.prepare_windows([self.route])
+        self.assertNotIsInstance(error.exception, AppLookupError)
+        self.assertEqual(calls, [row])
 
     def test_main_frame_is_scoped_separately_from_independent_windows(self):
         frame, li, app = self.silent_tree()

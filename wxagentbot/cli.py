@@ -32,7 +32,7 @@ def init_token(settings):
 
 
 def doctor(settings):
-    from .wechat import probe_desktop
+    from .wechat import AtspiWechat, probe_desktop
     missing = [name for name in ("gi", "PIL", "openai_codex", "fastapi", "uvicorn") if importlib.util.find_spec(name) is None]
     result = {"python": sys.version.split()[0], "missing_modules": missing,
               "listen_mode": settings.listen_mode,
@@ -43,7 +43,16 @@ def doctor(settings):
               "api_token_exists": settings.token_file.is_file(),
               "enabled_conversations": [c.id for c in settings.conversations if c.enabled],
               "notes": ["控件树可读不代表群聊提及元数据可读；用 inspect 实测", "doctor 不调用模型，也不发送微信消息"]}
-    result["ready"] = not missing and not result["missing_commands"] and not result["missing_libraries"] and not result["desktop_errors"] and result["api_token_exists"]
+    result["wechat_application"] = {}
+    if not result["desktop_errors"] and "gi" not in missing:
+        driver = AtspiWechat(dataclasses.replace(settings.wechat_options(), use_events=False))
+        try:
+            result["wechat_application"] = driver.check_application()
+        except Exception as e:
+            result["wechat_application"] = {**driver.app_diagnostics, "error": str(e)}
+        finally:
+            driver.close()
+    result["ready"] = not missing and not result["missing_commands"] and not result["missing_libraries"] and not result["desktop_errors"] and not result["wechat_application"].get("error") and result["api_token_exists"]
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["ready"] else 1
 

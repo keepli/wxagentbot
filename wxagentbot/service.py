@@ -11,7 +11,7 @@ import time
 from .codex_agent import CodexAgent
 from .config import ConfigError, Settings, load_settings
 from .store import Conflict, Store, destination
-from .wechat import AtspiWechat, DesktopBusy, NotSent
+from .wechat import AtspiWechat, AppLookupError, DesktopBusy, NotSent
 from .formatting import wechat_plain_text
 from .scheduling import (ScheduleError, describe_time, next_occurrence,
                          parse_schedule, schedule_command, ScheduledResult)
@@ -134,7 +134,7 @@ class Bridge:
                         self.desktop_status = "preparing_windows"
                         try:
                             await self.ui(self.wechat.prepare_windows, [r.wechat_target() for r in routes])
-                        except DesktopBusy:
+                        except (DesktopBusy, AppLookupError):
                             raise
                         except Exception as e:
                             self.window_setup_error = f"{type(e).__name__}: {e}"
@@ -153,8 +153,11 @@ class Bridge:
                     self.desktop_status, self.desktop_error = "paused", str(e)
                     await asyncio.sleep(self.settings.poll_seconds)
                 except Exception as e:
+                    error = f"{type(e).__name__}: {e}"
+                    if error != self.desktop_error:
+                        log.warning("wechat watcher failed: %s", error)
                     self.desktop_status = "degraded"
-                    self.desktop_error = f"{type(e).__name__}: {e}"
+                    self.desktop_error = error
                     await asyncio.sleep(self.settings.poll_seconds)
             else:
                 self.desktop_status = "idle"
@@ -413,4 +416,5 @@ class Bridge:
                 "scan_warnings": self.scan_warnings,
                 "scan_errors": self.scan_errors, "listen_mode": self.settings.listen_mode,
                 "windows_prepared": self.windows_prepared,
+                "wechat_application": getattr(self.wechat, "app_diagnostics", {}),
                 "wechat_diagnostics": self.wechat.last_diagnostics}

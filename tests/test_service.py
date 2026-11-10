@@ -9,7 +9,7 @@ from wxagentbot.demo import DemoAgent, DemoWechat
 from wxagentbot.domain import Message
 from wxagentbot.service import Bridge
 from wxagentbot.store import Store
-from wxagentbot.wechat import NotSent, SendUncertain
+from wxagentbot.wechat import AppLookupError, NotSent, SendUncertain
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
@@ -191,6 +191,28 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(self.bridge.watch_loop(), 0.35)
         self.assertEqual(self.ui.prepared, 1)
         self.assertEqual(self.bridge.status()["desktop"], "degraded")
+
+    async def test_temporary_app_lookup_failure_retries_before_window_input(self):
+        class TemporaryFailure(DemoWechat):
+            prepared, pumped = 0, 0
+            def prepare_windows(self, routes):
+                self.prepared += 1
+                if self.prepared == 1:
+                    raise AppLookupError("AT-SPI 应用暂未注册")
+            def pump(self):
+                self.pumped += 1
+                if self.pumped == 2:
+                    raise asyncio.CancelledError
+                return True
+        self.ui = TemporaryFailure()
+        self.bridge.wechat = self.ui
+        self.bridge.settings = dataclasses.replace(self.settings, listen_mode="independent", poll_seconds=0.01)
+        self.bridge.windows_prepared = False
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(self.bridge.watch_loop(), 2)
+        self.assertEqual(self.ui.prepared, 2)
+        self.assertTrue(self.bridge.windows_prepared)
+        self.assertIsNone(self.bridge.window_setup_error)
 
     async def test_one_failed_chat_is_visible_when_another_chat_succeeds(self):
         second = dataclasses.replace(self.route, id="bob", name="Bob", workspace=self.root / "bob")

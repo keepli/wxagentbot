@@ -19,6 +19,10 @@ class DesktopUnavailable(RuntimeError):
     pass
 
 
+class AppLookupError(DesktopUnavailable):
+    """Read-only application discovery failed; no desktop input was attempted."""
+
+
 class NotSent(RuntimeError):
     """Failure before the send action was invoked."""
 
@@ -83,6 +87,7 @@ class AtspiWechat:
         self.event_error = None
         self.deadline = 0.0
         self.last_diagnostics = {}
+        self.app_diagnostics = {}
         self.window = X11Window()
         self.capture = CompositeCapture()
         self.chat_frame = None
@@ -113,7 +118,7 @@ class AtspiWechat:
 
     def _event(self, event, *args):
         with contextlib.suppress(Exception):
-            if event.source.get_application().get_name().lower() == self.settings.app_name.lower():
+            if event.source.get_application().get_name().strip().casefold() == self.settings.app_name.strip().casefold():
                 self.dirty = True
 
     def pump(self) -> bool:
@@ -169,13 +174,98 @@ class AtspiWechat:
         return ""
 
     def _app(self):
-        desktop = self.Atspi.get_desktop(0)
-        apps = [desktop.get_child_at_index(i) for i in range(desktop.get_child_count())]
-        matches = [a for a in apps if self._name(a).lower() == self.settings.app_name.lower()]
-        if len(matches) != 1:
-            raise DesktopUnavailable("未找到唯一微信进程，请先登录微信")
-        matches[0].clear_cache()
-        return matches[0]
+        # Refresh before matching names: clearing only the chosen app leaves
+        # stale names/registry entries capable of preventing any selection.
+        report = {"configured_name": self.settings.app_name, "updated": time.time(),
+                  "applications": [], "matching_entries": 0, "candidate_pids": [],
+                  "registry_errors": 0, "selected_pid": None}
+        self.app_diagnostics = report
+        candidates = {}
+        try:
+            self._check()
+            desktop = self.Atspi.get_desktop(0)
+            refresh = getattr(desktop, "clear_cache_single", None) or desktop.clear_cache
+            refresh()
+            count = desktop.get_child_count()
+            if not 0 <= count <= self.settings.max_nodes:
+                raise RuntimeError("无效的 AT-SPI 应用数量")
+            for i in range(count):
+                self._check()
+                try:
+                    app = desktop.get_child_at_index(i)
+                    if app is None:
+                        report["registry_errors"] += 1
+                        continue
+                    refresh = getattr(app, "clear_cache_single", None) or app.clear_cache
+                    refresh()
+                    name = app.get_name() or ""
+                except Exception:
+                    report["registry_errors"] += 1
+                    continue
+                entry = {"name": name}
+                report["applications"].append(entry)
+                if name.strip().casefold() != self.settings.app_name.strip().casefold():
+                    continue
+                report["matching_entries"] += 1
+                try:
+                    if app.get_state_set().contains(self.Atspi.StateType.DEFUNCT):
+                        entry["state"] = "defunct"
+                        continue
+                    pid = app.get_process_id()
+                    if not 0 < pid < 2 ** 31:
+                        raise RuntimeError("无法确定微信 PID")
+                    entry["pid"] = pid
+                    child_count = app.get_child_count()
+                    if not 0 <= child_count <= self.settings.max_nodes:
+                        raise RuntimeError("无效的微信窗口数量")
+                    frames = []
+                    for j in range(child_count):
+                        self._check()
+                        frame = app.get_child_at_index(j)
+                        if self._role(frame) == "frame":
+                            frames.append(frame)
+                    entry["windows"] = len(frames)
+                    if not frames:
+                        entry["state"] = "no_windows"
+                        continue
+                    entry["state"] = "available"
+                    # Duplicate proxies for one process are not two clients.
+                    # Prefer the root exposing the main window and more frames.
+                    rank = (any(self._name(f) == "微信" for f in frames), len(frames))
+                    if pid not in candidates or rank > candidates[pid][0]:
+                        candidates[pid] = (rank, app)
+                except Exception as e:
+                    entry["state"], entry["error"] = "unavailable", type(e).__name__
+            report["candidate_pids"] = sorted(candidates)
+            self._check()
+        except Exception as e:
+            report["error"] = f"无法读取桌面 AT-SPI 应用列表（{type(e).__name__}）"
+            raise AppLookupError(report["error"]) from e
+        if not candidates:
+            observed = ", ".join(e["name"][:80] for e in report["applications"][:20]) or "空"
+            report["error"] = (f"AT-SPI 未发现可用微信应用（名称={self.settings.app_name!r}，"
+                               f"同名条目={report['matching_entries']}，可用进程=0，"
+                               f"读取失败={report['registry_errors']}，应用列表={observed}）；"
+                               "请检查桌面会话和微信无障碍接口，此结果不能判断是否已登录")
+            raise AppLookupError(report["error"])
+        if len(candidates) > 1:
+            report["error"] = (f"AT-SPI 发现多个可用微信进程（PID={report['candidate_pids']}，"
+                               f"同名条目={report['matching_entries']}），无法唯一确定目标")
+            raise AppLookupError(report["error"])
+        pid, (_, app) = next(iter(candidates.items()))
+        try:
+            app.clear_cache()
+        except Exception as e:
+            report["error"] = f"无法刷新微信控件缓存（PID={pid}，{type(e).__name__}）"
+            raise AppLookupError(report["error"]) from e
+        report["selected_pid"] = pid
+        return app
+
+    def check_application(self):
+        """Read-only health check; never activates windows or reads chat text."""
+        self._begin()
+        self._app()
+        return self.app_diagnostics
 
     def _visible(self, app):
         app.clear_cache()
@@ -336,6 +426,15 @@ class AtspiWechat:
 
     def prepare_windows(self, routes):
         """One-time setup only; regular silent reads never call this method."""
+        self._begin()
+        self._app()  # A failed preflight is safe to retry: no input yet.
+        try:
+            self._prepare_windows(routes)
+        except AppLookupError as e:
+            # Input may already have happened. Do not restart the click sequence.
+            raise DesktopUnavailable(f"准备独立窗口时微信连接中断，请检查窗口后重启：{e}") from e
+
+    def _prepare_windows(self, routes):
         for route in routes:
             self._begin()
             if self._independent_frame(self._app(), route, missing_ok=True) is not None:

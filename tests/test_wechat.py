@@ -449,3 +449,19 @@ class NativeAdapterTests(unittest.TestCase):
         n = Node(rect=(301, 122, 578, 57))
         self.assertEqual(self.driver._visual_direction(n, Screen(True)), "incoming")
         self.assertEqual(self.driver._visual_direction(n, Screen(False)), "outgoing")
+
+    def test_clipped_long_row_cannot_borrow_header_pixels_as_an_avatar(self):
+        from PIL import Image, ImageDraw
+        screen = Image.new('RGB', (600, 500), (250, 250, 250))
+        ImageDraw.Draw(screen).rectangle((16, 0, 56, 70), fill=(40, 40, 40))
+        row = Node(rect=(0, -200, 600, 420))
+        self.assertEqual(self.driver._visual_direction(row, screen, (0, 100, 600, 400)), 'unknown')
+
+    def test_long_bubble_direction_uses_avatar_area_only(self):
+        from PIL import Image, ImageDraw
+        screen = Image.new('RGB', (600, 600), (250, 250, 250))
+        draw = ImageDraw.Draw(screen)
+        draw.rectangle((544, 128, 584, 174), fill=(40, 40, 40))
+        draw.rectangle((16, 200, 56, 350), fill=(40, 40, 40))
+        row = Node(rect=(0, 120, 600, 300))
+        self.assertEqual(self.driver._visual_direction(row, screen, (0, 100, 600, 400)), 'outgoing')

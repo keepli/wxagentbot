@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 
 from .config import Conversation
-from .domain import HistoryGap, Message, context_key, new_tail, split_reply, task_prompt
+from .domain import HistoryGap, Message, context_key, message_decision, split_reply, tail_overlap
 from .scheduling import SchedulePlan, describe_time
+
+log = logging.getLogger(__name__)
 
 
 class Conflict(ValueError):
@@ -32,6 +35,8 @@ class Store:
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS snapshots (
           conversation TEXT PRIMARY KEY, fingerprints TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS snapshot_cursors (
+          conversation TEXT PRIMARY KEY, entries TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS tasks (
           id TEXT PRIMARY KEY, event_key TEXT UNIQUE NOT NULL,
           conversation TEXT NOT NULL, destination TEXT NOT NULL, context TEXT NOT NULL,
@@ -82,30 +87,70 @@ class Store:
         if not messages:
             return 0, None
         fingerprints = [m.fingerprint() for m in messages]
+        identities = [m.content_fingerprint() for m in messages]
+        entries = [dict(identity=identity, fingerprint=fingerprint, event_key=None,
+                        pending=False, reason="历史基线")
+                   for identity, fingerprint in zip(identities, fingerprints)]
         warning = None
+        records = []
+        lost_pending = 0
         with self.db:
             old = self.db.execute("SELECT * FROM snapshots WHERE conversation=?", (route.id,)).fetchone()
             seq = old["seq"] if old else 0
-            indices = []
+            indices = set()
             if old:
+                old_fingerprints = json.loads(old["fingerprints"])
+                cursor = self.db.execute("SELECT entries FROM snapshot_cursors WHERE conversation=?", (route.id,)).fetchone()
+                previous = json.loads(cursor["entries"]) if cursor else []
+                # An older runtime may have advanced the legacy snapshot after
+                # a rollback. Adopt that snapshot instead of trusting stale state.
+                compatible = bool(previous) and [e["fingerprint"] for e in previous] == old_fingerprints
+                old_keys = [e["identity"] for e in previous] if compatible else old_fingerprints
+                keys = identities if compatible else fingerprints
                 try:
-                    indices = new_tail(json.loads(old["fingerprints"]), fingerprints)
+                    old_start, start, length = tail_overlap(old_keys, keys)
+                    indices = set(range(start + length, len(messages)))
+                    if compatible:
+                        for offset in range(length):
+                            entries[start + offset] = dict(previous[old_start + offset])
                 except HistoryGap as e:
                     warning = str(e)
+                if compatible:
+                    retained = {e["event_key"] for e in entries}
+                    lost_pending = sum(e["pending"] and e["event_key"] not in retained for e in previous)
             created = 0
-            for index in indices:
-                seq += 1
-                message = messages[index]
-                prompt = task_prompt(route, message)
-                if not prompt:
+            for index, (message, entry) in enumerate(zip(messages, entries)):
+                first_seen = index in indices
+                changed = entry["fingerprint"] != fingerprints[index]
+                entry["fingerprint"] = fingerprints[index]
+                if not first_seen and not entry["pending"]:
                     continue
-                now = time.time()
-                event_key = f"{route.id}:{seq}"
-                self.db.execute("INSERT INTO tasks(id,event_key,conversation,destination,context,sender,prompt,status,created,updated) VALUES(?,?,?,?,?,?,?,'queued',?,?)", (
-                    uuid.uuid4().hex, event_key, route.id, destination(route), context_key(route, message, event_key=event_key),
-                    message.sender, prompt, now, now))
-                created += 1
+                if first_seen:
+                    seq += 1
+                    entry["event_key"] = f"{route.id}:{seq}"
+                decision = message_decision(route, message)
+                if decision.prompt:
+                    now = time.time()
+                    event_key = entry["event_key"]
+                    self.db.execute("INSERT INTO tasks(id,event_key,conversation,destination,context,sender,prompt,status,created,updated) VALUES(?,?,?,?,?,?,?,'queued',?,?)", (
+                        uuid.uuid4().hex, event_key, route.id, destination(route), context_key(route, message, event_key=event_key),
+                        message.sender, decision.prompt, now, now))
+                    created += 1
+                if first_seen or changed or entry["reason"] != decision.reason:
+                    records.append((first_seen, entry["event_key"], message, decision.reason))
+                entry["pending"], entry["reason"] = decision.pending, decision.reason
             self.db.execute("INSERT INTO snapshots VALUES(?,?,?) ON CONFLICT(conversation) DO UPDATE SET fingerprints=excluded.fingerprints, seq=excluded.seq", (route.id, json.dumps(fingerprints), seq))
+            self.db.execute("INSERT INTO snapshot_cursors VALUES(?,?) ON CONFLICT(conversation) DO UPDATE SET entries=excluded.entries", (route.id, json.dumps(entries)))
+        if not old:
+            log.info("微信监听基线 会话=%s(%s) 历史消息=%d", route.name, route.id, len(messages))
+        for first_seen, event_key, message, reason in records:
+            log.info("%s 会话=%s(%s) 事件=%s 发送人=%s 方向=%s 处理=%s 内容=%s",
+                     "微信新消息" if first_seen else "微信消息识别更新", route.name, route.id,
+                     event_key, message.sender or "未识别", message.direction, reason,
+                     json.dumps(message.text, ensure_ascii=False))
+        if lost_pending:
+            note = f"{lost_pending} 条待识别消息已移出消息窗口，未执行；请检查接收日志"
+            warning = f"{warning}；{note}" if warning else note
         return created, warning
 
     def enqueue(self, route: Conversation, text: str, limit: int, key: str | None = None) -> dict:

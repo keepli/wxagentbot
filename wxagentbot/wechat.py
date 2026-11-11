@@ -520,19 +520,27 @@ class AtspiWechat:
                 pass
         return None
 
-    def _visual_direction(self, node, screen):
+    def _visual_direction(self, node, screen, viewport=None):
         if screen is None:
             return "unknown"
         x, y, w, h = self._rect(node)
         if w < 100 or h < 20:
             return "unknown"
+        bx, by, br, bb = getattr(screen, "bounds", (0, 0, screen.width, screen.height))
+        if viewport is not None:
+            vx, vy, vw, vh = viewport
+            bx, by, br, bb = max(bx, vx), max(by, vy), min(br, vx + vw), min(bb, vy + vh)
+        top, bottom = y + 8, y + min(56, h - 4)
+        # A clipped avatar is not evidence of message direction. Long bubbles
+        # must not sample header controls or text far below the avatar.
+        if top < by or bottom > bb or x + 16 < bx or x + w - 16 > br:
+            return "unknown"
         # Only classify sides when avatar-shaped areas have clear contrast.
         # Text recognition and sender identity never come from these pixels.
         def ink(left, right):
             count = 0
-            bx, by, br, bb = getattr(screen, "bounds", (0, 0, screen.width, screen.height))
             for xx in range(max(bx, left), min(br, right), 2):
-                for yy in range(max(by, y + 8), min(bb, y + h - 4), 2):
+                for yy in range(top, bottom, 2):
                     r, g, b = screen.getpixel((xx, yy))[:3]
                     count += min(r, g, b) < 185
             return count
@@ -562,7 +570,7 @@ class AtspiWechat:
             attr = attributes(n)
             direction = attr.get("message-direction", attr.get("direction", "unknown"))
             if direction not in ("incoming", "outgoing"):
-                direction = self._visual_direction(n, screen)
+                direction = self._visual_direction(n, screen, self._rect(li) if screen is not None else None)
             sender = attr.get("sender", "")
             if self.settings.sender_regex:
                 match = re.match(self.settings.sender_regex, text)

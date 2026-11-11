@@ -20,7 +20,7 @@ wechat:
   # sender_regex: '^(?P<sender>[^\n]+)\n(?P<text>[\s\S]+)$'
 
 codex:
-  model: "gpt-6-luna"
+  model: "gpt-6.1-terra"
   reasoning_effort: "medium"
   # 不同会话最多同时处理 3 个；设为 1 可恢复全局串行。
   max_parallel_conversations: 3

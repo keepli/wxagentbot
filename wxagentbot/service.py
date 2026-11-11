@@ -101,6 +101,7 @@ class Bridge:
                 self.scan_errors.pop(route.id, None)
                 if warning:
                     self.scan_warnings[route.id] = warning
+                    log.warning("微信消息对齐警告 会话=%s(%s): %s", route.name, route.id, warning)
                 else:
                     self.scan_warnings.pop(route.id, None)
                 if created:

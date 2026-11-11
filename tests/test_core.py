@@ -131,6 +131,133 @@ class PersistenceTests(unittest.TestCase):
         self.store = Store(self.path)
         self.assertEqual(self.store.ingest(group, [history, mention, mention])[0], 0)
 
+    def group(self, **changes):
+        return dataclasses.replace(self.r, kind="group", self_names=("小小🤖",),
+                                   mention_mode="text", missing_sender_policy="shared", **changes)
+
+    def test_direction_change_of_old_reply_does_not_swallow_first_mention(self):
+        group = self.group()
+        reply = Message("上一条长回复", direction="outgoing")
+        mention = Message("@小小🤖\u2005骨王有新作消息吗", direction="incoming")
+        self.store.ingest(group, [reply])
+        shifted = dataclasses.replace(reply, direction="incoming")
+        self.assertEqual(self.store.ingest(group, [shifted, mention]), (1, None))
+        self.assertEqual(self.store.ingest(group, [shifted, mention, mention]), (1, None))
+        self.assertEqual(self.store.ingest(group, [reply, mention, mention]), (0, None))
+        self.assertEqual([t["prompt"] for t in self.store.recent("tasks")], ["骨王有新作消息吗"] * 2)
+
+    def test_pending_direction_survives_restart_and_runs_once_when_resolved(self):
+        group = self.group()
+        history = Message("历史", direction="outgoing")
+        pending = Message("@小小🤖 帮忙")
+        self.store.ingest(group, [history])
+        self.assertEqual(self.store.ingest(group, [history, pending]), (0, None))
+        self.store.close()
+        self.store = Store(self.path)
+        incoming = dataclasses.replace(pending, direction="incoming")
+        self.assertEqual(self.store.ingest(group, [history, incoming]), (1, None))
+        self.assertEqual(self.store.ingest(group, [history, incoming]), (0, None))
+        task = self.store.recent("tasks")[0]
+        self.assertEqual((task["event_key"], task["prompt"]), ("alice:1", "帮忙"))
+        self.assertEqual(self.store.db.execute('SELECT seq FROM snapshots').fetchone()[0], 1)
+
+    def test_two_identical_pending_rows_keep_separate_events(self):
+        group = self.group()
+        history, pending = Message("历史"), Message("@小小🤖 帮忙")
+        incoming = dataclasses.replace(pending, direction="incoming")
+        self.store.ingest(group, [history])
+        self.store.ingest(group, [history, pending, pending])
+        self.assertEqual(self.store.ingest(group, [history, incoming, pending])[0], 1)
+        self.assertEqual(self.store.ingest(group, [history, incoming, incoming])[0], 1)
+        self.assertEqual(self.store.ingest(group, [history, incoming, incoming])[0], 0)
+        self.assertEqual({t['event_key'] for t in self.store.recent('tasks')}, {'alice:1', 'alice:2'})
+
+    def test_pending_row_resolved_as_outgoing_never_becomes_a_task(self):
+        group = self.group()
+        history, pending = Message("历史"), Message("@小小🤖 帮忙")
+        self.store.ingest(group, [history])
+        self.store.ingest(group, [history, pending])
+        self.assertEqual(self.store.ingest(group, [history, dataclasses.replace(pending, direction='outgoing')])[0], 0)
+        # Subsequent visual misclassification must not turn an own reply into input.
+        self.assertEqual(self.store.ingest(group, [history, dataclasses.replace(pending, direction='incoming')])[0], 0)
+        self.assertFalse(self.store.recent('tasks'))
+
+    def test_unknown_baseline_rows_are_not_replayed_when_they_become_incoming(self):
+        group = self.group()
+        old = Message("@小小🤖 历史任务")
+        self.store.ingest(group, [old])
+        self.assertEqual(self.store.ingest(group, [dataclasses.replace(old, direction='incoming')]), (0, None))
+
+    def test_sender_and_mention_metadata_can_resolve_without_changing_identity(self):
+        group = dataclasses.replace(self.group(), mention_mode='metadata', allowed_senders=('Alice',))
+        history = Message("历史")
+        pending = Message("任务", direction='incoming')
+        self.store.ingest(group, [history])
+        self.assertEqual(self.store.ingest(group, [history, pending])[0], 0)
+        with_sender = dataclasses.replace(pending, sender='Alice')
+        self.assertEqual(self.store.ingest(group, [history, with_sender])[0], 0)
+        ready = dataclasses.replace(with_sender, mentions=('小小🤖',), mention_verified=True)
+        self.assertEqual(self.store.ingest(group, [history, ready]), (1, None))
+        self.assertEqual(self.store.ingest(group, [history, ready]), (0, None))
+        self.assertEqual(self.store.recent('tasks')[0]['sender'], 'Alice')
+
+    def test_content_anchor_is_stable_when_optional_metadata_changes(self):
+        original = Message('正文')
+        updated = dataclasses.replace(original, sender='Alice', direction='incoming',
+                                      mentions=('我',), mention_verified=True)
+        self.assertEqual(original.content_fingerprint(), updated.content_fingerprint())
+        self.assertNotEqual(original.fingerprint(), updated.fingerprint())
+
+    def test_legacy_snapshot_adopts_cursor_without_replaying_history(self):
+        old = Message('旧消息', 'Alice', 'incoming')
+        new = Message('新任务', 'Alice', 'incoming')
+        import json
+        with self.store.db:
+            self.store.db.execute('INSERT INTO snapshots VALUES(?,?,?)',
+                                  (self.r.id, json.dumps([old.fingerprint()]), 8))
+        self.assertEqual(self.store.ingest(self.r, [old, new]), (1, None))
+        self.assertEqual(self.store.recent('tasks')[0]['event_key'], 'alice:9')
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.ingest(self.r, [dataclasses.replace(old, direction='unknown'), new]), (0, None))
+
+    def test_pending_messages_leaving_the_window_are_reported_without_replay(self):
+        group = self.group()
+        history, pending = Message('历史'), Message('@小小🤖 帮忙')
+        self.store.ingest(group, [history])
+        self.store.ingest(group, [history, pending])
+        count, warning = self.store.ingest(group, [Message('新窗口')])
+        self.assertEqual(count, 0)
+        self.assertIn('待识别消息已移出', warning)
+        self.assertFalse(self.store.recent('tasks'))
+
+    def test_logs_message_content_and_decision_once_not_every_poll(self):
+        group = self.group()
+        history = Message('历史')
+        pending = Message('@小小🤖 帮忙\n第二行')
+        self.store.ingest(group, [history])
+        with self.assertLogs('wxagentbot.store', level='INFO') as captured:
+            self.store.ingest(group, [history, pending])
+            self.store.ingest(group, [history, pending])
+            incoming = dataclasses.replace(pending, direction='incoming')
+            self.store.ingest(group, [history, incoming])
+            self.store.ingest(group, [history, incoming])
+        self.assertEqual(len(captured.output), 2)
+        self.assertIn('微信新消息', captured.output[0])
+        self.assertIn('收发方向待识别', captured.output[0])
+        self.assertIn('@小小🤖 帮忙\\n第二行', captured.output[0])
+        self.assertIn('微信消息识别更新', captured.output[1])
+        self.assertIn('已入队', captured.output[1])
+
+    def test_unmentioned_group_messages_are_logged_as_ignored(self):
+        group = self.group()
+        history = Message('历史')
+        self.store.ingest(group, [history])
+        with self.assertLogs('wxagentbot.store', level='INFO') as captured:
+            self.assertEqual(self.store.ingest(group, [history, Message('普通聊天', direction='incoming')])[0], 0)
+        self.assertIn('普通聊天', captured.output[0])
+        self.assertIn('未提及本账号', captured.output[0])
+
     def test_empty_reload_does_not_erase_cursor(self):
         old = Message("A", "Alice", "incoming")
         self.store.ingest(self.r, [old])

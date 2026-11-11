@@ -54,3 +54,8 @@ class Message:
     def fingerprint(self) -> str:
         payload = dataclasses.asdict(self)
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+    def content_fingerprint(self) -> str:
+        """Stable snapshot anchor; direction/sender/mention metadata can settle later."""
+        payload = {"text": self.text, "kind": self.kind}
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()

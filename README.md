@@ -85,11 +85,11 @@ conversations:
 
 ```yaml
 codex:
-  model: "gpt-6-luna"
+  model: "gpt-6.1-terra"
   reasoning_effort: "medium"
 ```
 
-`reasoning_effort` 接受 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`；实际可用档位取决于所选模型和账号，SDK 不支持的组合会返回任务错误。GPT-6 Luna 支持 `medium`，详见 [OpenAI 官方模型说明](https://developers.openai.com/api/docs/models/gpt-6-luna)。省略该项或设为 `null` 时不覆盖 Codex 的默认强度。
+`reasoning_effort` 接受 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`；实际可用档位取决于所选模型和账号，SDK 不支持的组合会返回任务错误。GPT-6.1 Terra 支持 `medium`，详见 [OpenAI 官方模型说明](https://developers.openai.com/api/docs/models/gpt-6.1-terra)。省略该项或设为 `null` 时不覆盖 Codex 的默认强度。
 
 模型和强度通过 SDK 的新建/续接会话参数传入，不写入 `~/.codex/config.toml`，不设置全局环境变量。只修改思考强度会继续原会话；模型变化沿用现有的会话键规则。修改 YAML 后先运行 `./run.sh check`，再重启服务加载。
 
@@ -293,14 +293,16 @@ python3 examples/push.py --base-url https://你的地址 --conversation friend -
 
 ## 恢复、去重和日志
 
-- 首次看到一个聊天时建立基线，不执行已有历史消息。之后对齐上次窗口尾部，保留连续相同文本的新增条目。
+- 首次看到一个聊天时建立基线，不执行已有历史消息。之后按正文和消息类型对齐上次窗口尾部，收发方向、发送人和提及元数据变化不会导致游标重建；连续相同文本仍按出现次数分别处理。
+- 新消息的收发方向或必要身份元数据尚未识别时，保存待识别状态，后续扫描识别成功后使用原事件编号处理，重启后也能继续。已有历史、已处理消息和本机发出的消息不会因元数据变化重新执行；待识别消息移出窗口时报告缺口。
 - 窗口没有重叠时重新建立基线并在 `/v1/status.scan_warnings` 记录缺口，避免把历史批量当成新任务。因此不能保证高频聊天无损，也无法区分所有“同文替换且窗口不增长”的情况。
 - 消息游标和新任务在同一 SQLite 事务中提交；最终回复和发送记录也一起提交。已完成的 Codex 任务不会因发送失败而重新执行。
 - 中断时的 `running` 任务恢复为 `interrupted`，发送中的记录恢复为 `unknown`，均不自动重跑或重发。
 - 对确认尚未发送的 `failed` 记录，可执行 `./run.sh retry-message 发送记录ID` 重新入队，复用已有回复；`unknown` 和 `sent` 不允许通过此命令重试。
 - 需要先更新运行代码时，可执行 `./run.sh retry-message 发送记录ID --after-restart`，只登记请求，在服务下次启动时补发。若启动前该记录已经发送或变为不确定状态，则跳过。
 - 分段回复逐段记录进度；`unknown` 需先核对微信，避免重复发送。`failed` 表示本次未能执行发送。修正问题后，可用新的幂等键主动推送已保存的任务结果。
-- 日志默认写到标准错误，仅包含会话 ID、任务 ID 和异常类型，不记录 Token 或聊天正文。SQLite 包含任务正文和结果，请按私人数据管理。
+- 控制台日志默认写到标准错误，按新消息打印会话名称/ID、事件编号、识别到的发送人、收发方向、处理结果及完整正文。处理结果包括“已入队”“收发方向待识别”“未提及本账号”“本机发出”等；同一快照反复轮询不会重复打印。正文中的换行以 `\n` 展示，待识别消息变为可处理时打印一次“微信消息识别更新”。首次基线只记录历史数量；日志不记录 Token。
+- SQLite 包含任务正文和结果，控制台日志也包含聊天正文，请按私人数据管理。
 
 ## 测试与离线演示
 

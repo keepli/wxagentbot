@@ -239,6 +239,39 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.process_one_delivery()
         self.assertEqual(self.ui.sent[0], ("alice", "演示任务已完成：帮忙"))
 
+    async def test_first_group_mention_after_old_reply_changes_direction_is_answered(self):
+        group = dataclasses.replace(self.route, kind='group', self_names=('我',),
+                                    mention_mode='text', missing_sender_policy='shared')
+        self.bridge.settings = dataclasses.replace(self.settings, conversations=(group,))
+        reply = Message('上一条长回复', direction='outgoing')
+        self.ui.messages['alice'] = [reply]
+        await self.bridge.scan_once()
+        self.ui.messages['alice'] = [dataclasses.replace(reply, direction='incoming'),
+                                     Message('@我 骨王有新作消息吗', direction='incoming')]
+        await self.bridge.scan_once()
+        self.assertTrue(await self.bridge.process_one_task())
+        self.assertTrue(await self.bridge.process_one_delivery())
+        await self.bridge.scan_once()
+        self.assertFalse(await self.bridge.process_one_task())
+        self.assertEqual(self.ui.sent, [('alice', '演示任务已完成：骨王有新作消息吗')])
+        self.assertFalse(self.bridge.scan_warnings)
+
+    async def test_pending_first_mention_is_answered_after_rescan_without_resend(self):
+        group = dataclasses.replace(self.route, kind='group', self_names=('我',),
+                                    mention_mode='text', missing_sender_policy='shared')
+        self.bridge.settings = dataclasses.replace(self.settings, conversations=(group,))
+        history, pending = Message('历史'), Message('@我 帮忙')
+        self.ui.messages['alice'] = [history]
+        await self.bridge.scan_once()
+        self.ui.messages['alice'] = [history, pending]
+        await self.bridge.scan_once()
+        self.assertFalse(await self.bridge.process_one_task())
+        self.ui.messages['alice'] = [history, dataclasses.replace(pending, direction='incoming')]
+        await self.bridge.scan_once()
+        self.assertTrue(await self.bridge.process_one_task())
+        await self.bridge.process_one_delivery()
+        self.assertEqual(self.ui.sent, [('alice', '演示任务已完成：帮忙')])
+
     async def test_private_and_group_are_watched_and_reply_to_their_own_chats(self):
         group = Conversation("group", "测试群", "group", self.root / "group", True,
                              self_names=("我",), mention_mode="text")
